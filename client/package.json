@@ -8,15 +8,6 @@
     "build": "vite build",
     "preview": "vite preview"
   },
-  "keywords": [
-    "russian",
-    "language",
-    "teacher",
-    "translate",
-    "libretranslate",
-    "electron",
-    "websocket"
-  ],
   "author": "Твой Имя",
   "license": "MIT",
   "dependencies": {

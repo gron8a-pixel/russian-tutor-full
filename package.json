@@ -1,9 +1,11 @@
 {
-  "scripts": {
-    "build": "cd client && npm ci && npm run build && cd ../server && rm -rf public && mv ../client/dist public",
-    "start": "cd server && node index.js"
+  "name": "russian-tutor-full",
+  "version": "1.0.0",
+  "engines": {
+    "node": "18.x"
   },
-  "devDependencies": {
-    "cpy-cli": "^6.0.0"
+  "scripts": {
+    "build": "cd client && npm ci && npm run build",
+    "start": "cd server && node index.js"
   }
 }

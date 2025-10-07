@@ -1,0 +1,14 @@
+{
+  "name": "russian-tutor-server",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "build": "echo 'Бэкенд не требует сборки'"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.14.2",
+    "axios": "^1.6.0"
+  }
+}

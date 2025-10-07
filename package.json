@@ -1,8 +1,9 @@
 {
-  "name": "russian-tutor-full",
-  "version": "1.0.0",
   "scripts": {
-    "build": "cd client && npm install && npm run build",
-    "start": "cd server && npm install && node index.js"
+    "build": "cd client && npm ci && npm run build && cd ../server && rm -rf public && mv ../client/dist public",
+    "start": "cd server && node index.js"
+  },
+  "devDependencies": {
+    "cpy-cli": "^6.0.0"
   }
 }

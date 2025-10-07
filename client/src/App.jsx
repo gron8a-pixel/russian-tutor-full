@@ -1,4 +1,4 @@
-// src/App.jsx
+// client/src/App.jsx
 import { useState, useEffect, useRef } from 'react';
 
 function generateSessionId() {
@@ -16,18 +16,22 @@ function formatTime(seconds) {
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
-function App() {
-  const initialParams = new URLSearchParams(window.location.search);
-  let initialRole = initialParams.get('role') || 'teacher';
-  let initialSessionId = initialParams.get('sessionId');
-  let initialLang = initialParams.get('lang') || 'en';
+export default function App() {
+  // === URL params ===
+  const urlParams = new URLSearchParams(window.location.search);
+  const initialRole = urlParams.get('role') || 'teacher';
+  const initialSessionId = urlParams.get('sessionId') || (initialRole === 'teacher' ? generateSessionId() : null);
+  const initialLang = urlParams.get('lang') || 'en';
 
-  if (initialRole === 'teacher' && !initialSessionId) {
-    initialSessionId = generateSessionId();
-    const newUrl = `${window.location.pathname}?role=teacher&sessionId=${initialSessionId}&lang=${initialLang}`;
-    window.history.replaceState({}, '', newUrl);
-  }
+  // Обновляем URL для учителя, чтобы закрепить sessionId
+  useEffect(() => {
+    if (initialRole === 'teacher' && !urlParams.has('sessionId')) {
+      const newUrl = `${window.location.pathname}?role=teacher&sessionId=${initialSessionId}&lang=${initialLang}`;
+      window.history.replaceState({}, '', newUrl);
+    }
+  }, [initialRole, initialSessionId, initialLang, urlParams]);
 
+  // === Состояния ===
   const [role] = useState(initialRole);
   const [sessionId] = useState(initialSessionId);
   const [studentLang, setStudentLang] = useState(initialLang);
@@ -51,29 +55,53 @@ function App() {
     ]
   };
 
+  // === WebSocket ===
   useEffect(() => {
-    const socket = new WebSocket(`wss://russian-tutor-server.onrender.com?...`);
+    if (!sessionId) return;
+
+    // ✅ Подключаемся к тому же хосту, откуда загружена страница
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const socket = new WebSocket(`${protocol}://${window.location.host}`);
+
     setWs(socket);
 
-    socket.onopen = () => setStatus('Онлайн');
-    
+    socket.onopen = () => {
+      setStatus('Онлайн');
+      socket.send(JSON.stringify({
+        type: 'join_session',
+        role,
+        sessionId,
+        lang: role === 'student' ? studentLang : 'ru'
+      }));
+    };
+
     socket.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      
-      if (msg.type === 'timer_update') {
-        setTimerSeconds(msg.seconds);
-      } 
-      else if (msg.type === 'message') {
-        setHistory(prev => [...prev, msg]);
-      }
-      else if (msg.type === 'webrtc_signal') {
-        handleSignal(msg.signal, msg.from);
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'timer_update') {
+          setTimerSeconds(msg.seconds);
+        } else if (msg.type === 'message') {
+          setHistory(prev => [...prev, msg]);
+        } else if (msg.type === 'webrtc_signal') {
+          handleSignal(msg.signal);
+        }
+      } catch (e) {
+        console.error('Invalid message', e);
       }
     };
 
-    socket.onerror = () => setStatus('Ошибка подключения');
-    
-    return () => socket.close();
+    socket.onerror = (err) => {
+      console.error('WebSocket error:', err);
+      setStatus('Ошибка подключения');
+    };
+
+    socket.onclose = () => {
+      setStatus('Отключено');
+    };
+
+    return () => {
+      socket.close();
+    };
   }, [sessionId, role, studentLang]);
 
   // === WebRTC ===
@@ -93,7 +121,7 @@ function App() {
       };
 
       pc.onicecandidate = (event) => {
-        if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+        if (event.candidate && ws?.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
             type: 'webrtc_signal',
             signal: { type: 'candidate', candidate: event.candidate }
@@ -110,11 +138,11 @@ function App() {
         }));
       }
     } catch (err) {
-      setError('Ошибка камеры: ' + err.message);
+      setError('Ошибка камеры: ' + (err.message || err));
     }
   };
 
-  const handleSignal = async (signal, from) => {
+  const handleSignal = async (signal) => {
     const pc = peerConnectionRef.current;
     if (!pc) return;
 
@@ -131,22 +159,25 @@ function App() {
           type: 'webrtc_signal',
           signal: { type: 'answer', sdp: answer.sdp }
         }));
-      }
-      else if (signal.type === 'answer' && role === 'teacher') {
+      } else if (signal.type === 'answer' && role === 'teacher') {
         await pc.setRemoteDescription(new RTCSessionDescription(signal));
-      }
-      else if (signal.type === 'candidate') {
+      } else if (signal.type === 'candidate') {
         await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
       }
     } catch (err) {
-      setError('Ошибка WebRTC: ' + err.message);
+      setError('Ошибка WebRTC: ' + (err.message || err));
     }
   };
 
   // === Чат ===
   const handleSend = () => {
     if (!inputText.trim() || !ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ text: inputText }));
+    ws.send(JSON.stringify({
+      type: 'message',
+      role,
+      original: inputText,
+      lang: role === 'teacher' ? 'ru' : studentLang
+    }));
     setInputText('');
   };
 
@@ -157,13 +188,14 @@ function App() {
   };
 
   const sendTimerCommand = (action) => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'timer_command', action }));
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'timer_command', action, sessionId }));
     }
   };
 
+  // ✅ Публичная ссылка для ученика
   const studentLink = role === 'teacher'
-    ? `http://localhost:3000?role=student&sessionId=${sessionId}&lang=${studentLang}`
+    ? `${window.location.origin}?role=student&sessionId=${sessionId}&lang=${studentLang}`
     : null;
 
   return (
@@ -202,7 +234,6 @@ function App() {
 
       {error && <div style={{ color: 'red', marginBottom: '10px', padding: '8px', backgroundColor: '#ffebee', borderRadius: '4px' }}>{error}</div>}
 
-      {/* Кнопка видеосвязи */}
       {role === 'teacher' && !isVideoActive && (
         <div style={{ marginBottom: '20px' }}>
           <button 
@@ -222,46 +253,24 @@ function App() {
         borderRadius: '8px', 
         marginBottom: '20px',
         fontSize: '22px',
-        fontWeight: 'bold',
-        color: '#333'
+        fontWeight: 'bold'
       }}>
         🕒 {formatTime(timerSeconds)}
       </div>
 
-      {/* Управление таймером */}
       {role === 'teacher' && (
         <div style={{ textAlign: 'center', marginBottom: '20px' }}>
-          <button 
-            onClick={() => sendTimerCommand('start')}
-            style={{ padding: '8px 16px', margin: '0 5px', backgroundColor: '#4CAF50', color: 'white', border: 'none', borderRadius: '4px' }}
-          >
-            ▶️ Старт
-          </button>
-          <button 
-            onClick={() => sendTimerCommand('pause')}
-            style={{ padding: '8px 16px', margin: '0 5px', backgroundColor: '#FF9800', color: 'white', border: 'none', borderRadius: '4px' }}
-          >
-            ⏸️ Пауза
-          </button>
-          <button 
-            onClick={() => sendTimerCommand('stop')}
-            style={{ padding: '8px 16px', margin: '0 5px', backgroundColor: '#F44336', color: 'white', border: 'none', borderRadius: '4px' }}
-          >
-            ⏹️ Стоп
-          </button>
+          <button onClick={() => sendTimerCommand('start')} style={{ padding: '8px 16px', margin: '0 5px', backgroundColor: '#4CAF50', color: 'white', border: 'none', borderRadius: '4px' }}>▶️ Старт</button>
+          <button onClick={() => sendTimerCommand('pause')} style={{ padding: '8px 16px', margin: '0 5px', backgroundColor: '#FF9800', color: 'white', border: 'none', borderRadius: '4px' }}>⏸️ Пауза</button>
+          <button onClick={() => sendTimerCommand('stop')} style={{ padding: '8px 16px', margin: '0 5px', backgroundColor: '#F44336', color: 'white', border: 'none', borderRadius: '4px' }}>⏹️ Стоп</button>
         </div>
       )}
 
-      {/* Язык и ссылка */}
       {role === 'teacher' && (
         <div style={{ marginBottom: '15px' }}>
           <label>
             Язык ученика:
-            <select 
-              value={studentLang}
-              onChange={(e) => handleLangChange(e.target.value)}
-              style={{ marginLeft: '8px', padding: '4px' }}
-            >
+            <select value={studentLang} onChange={(e) => handleLangChange(e.target.value)} style={{ marginLeft: '8px', padding: '4px' }}>
               <option value="en">Английский</option>
               <option value="es">Испанский</option>
               <option value="fr">Французский</option>
@@ -279,20 +288,9 @@ function App() {
 
       {studentLink && (
         <div style={{ marginBottom: '20px', padding: '12px', backgroundColor: '#e8f5e9', borderRadius: '6px' }}>
-          <strong>🔗 Уникальная ссылка для ученика:</strong><br />
-          <input 
-            type="text" 
-            value={studentLink} 
-            readOnly 
-            style={{ width: '100%', padding: '6px', marginTop: '6px', fontSize: '14px' }}
-            onClick={(e) => e.target.select()}
-          />
-          <button 
-            onClick={() => navigator.clipboard.writeText(studentLink)}
-            style={{ marginTop: '6px', padding: '6px 10px', fontSize: '13px', backgroundColor: '#4CAF50', color: 'white', border: 'none', borderRadius: '4px' }}
-          >
-            📋 Копировать ссылку
-          </button>
+          <strong>🔗 Ссылка для ученика:</strong><br />
+          <input type="text" value={studentLink} readOnly style={{ width: '100%', padding: '6px', marginTop: '6px', fontSize: '14px' }} onClick={(e) => e.target.select()} />
+          <button onClick={() => navigator.clipboard.writeText(studentLink)} style={{ marginTop: '6px', padding: '6px 10px', fontSize: '13px', backgroundColor: '#4CAF50', color: 'white', border: 'none', borderRadius: '4px' }}>📋 Копировать</button>
         </div>
       )}
 
@@ -305,13 +303,7 @@ function App() {
           rows="2"
           style={{ width: '100%', marginBottom: '10px', padding: '8px' }}
         />
-        <button 
-          onClick={handleSend}
-          disabled={!inputText.trim()}
-          style={{ padding: '8px 16px', backgroundColor: '#2196F3', color: 'white', border: 'none', borderRadius: '4px' }}
-        >
-          ➡️ Отправить
-        </button>
+        <button onClick={handleSend} disabled={!inputText.trim()} style={{ padding: '8px 16px', backgroundColor: '#2196F3', color: 'white', border: 'none', borderRadius: '4px' }}>➡️ Отправить</button>
       </div>
 
       {/* История */}
@@ -324,7 +316,7 @@ function App() {
             history.map((msg, i) => (
               <div key={i} style={{ marginBottom: '10px', padding: '8px', backgroundColor: msg.role === 'teacher' ? '#e8f5e9' : '#e3f2fd', borderRadius: '4px' }}>
                 <strong>{msg.role === 'teacher' ? 'Учитель:' : 'Ученик:'}</strong> {msg.original}<br />
-                <em>→ Перевод: {msg.translated}</em>
+                <em>→ Перевод: {msg.translated || '...'}</em>
               </div>
             ))
           )}
@@ -333,5 +325,3 @@ function App() {
     </div>
   );
 }
-
-export default App;

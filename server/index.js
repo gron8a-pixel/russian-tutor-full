@@ -1,155 +1,151 @@
-// server/index.js (обновлённый финальный вариант)
 const express = require('express');
+const path = require('path');
 const http = require('http');
 const WebSocket = require('ws');
-const axios = require('axios');
-const path = require('path');
+const fs = require('fs'); // ← добавлено для проверки
 
+// Инициализация Express
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
 
+const PUBLIC_DIR = path.join(__dirname, 'public');
+
+// 🔍 Проверка: существует ли папка public и index.html?
+if (!fs.existsSync(PUBLIC_DIR)) {
+  console.error('❌ Папка public не найдена! Запустите сначала сборку фронтенда (npm run build).');
+  process.exit(1);
+}
+
+const INDEX_PATH = path.join(PUBLIC_DIR, 'index.html');
+if (!fs.existsSync(INDEX_PATH)) {
+  console.error('❌ Файл public/index.html не найден! Сборка фронтенда не выполнена.');
+  process.exit(1);
+}
+
+console.log('✅ Найден index.html, размер:', fs.statSync(INDEX_PATH).size, 'байт');
+
+// Раздача статических файлов
+app.use(express.static(PUBLIC_DIR, {
+  etag: false,        // отключить кэширование на Render (для отладки)
+  lastModified: false
+}));
+
+// SPA fallback: только если файл не найден И это не API-запрос
+app.get('*', (req, res) => {
+  // Не перехватываем запросы к явным файлам (например, /assets/...)
+  // Но express.static уже обработал их, так что сюда попадают только "не найденные"
+  res.sendFile(INDEX_PATH);
+});
+
+// HTTP-сервер
+const server = http.createServer(app);
+
+// WebSocket-сервер
+const wss = new WebSocket.Server({ noServer: true });
+
+// Обработка upgrade для WebSocket
+server.on('upgrade', (request, socket, head) => {
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit('connection', ws, request);
+  });
+});
+
+// Хранилище сессий
 const sessions = {};
 
-// Используем публичный LibreTranslate (временно)
-const LIBRE_API = 'https://libretranslate.com';
+wss.on('connection', (ws, req) => {
+  console.log('🔌 Новое WebSocket-соединение');
 
-async function translateText(text, sourceLang, targetLang) {
-  try {
-    const response = await axios.post(`${LIBRE_API}/translate`, {
-      q: text,
-      source: sourceLang,
-      target: targetLang,
-      format: 'text'
-    }, { timeout: 5000 });
-    return response.data.translatedText || text;
-  } catch (error) {
-    console.error('Ошибка перевода:', error.message);
-    return `[Ошибка перевода] ${text}`;
-  }
-}
-
-function broadcastToSession(sessionId, message) {
-  const session = sessions[sessionId];
-  if (!session) return;
-  [session.teacher, session.student].forEach(ws => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(message));
-    }
-  });
-}
-
-function startTimer(sessionId) {
-  const session = sessions[sessionId];
-  if (!session || session.timer?.intervalId) return;
-  session.timer = {
-    startTime: Date.now(),
-    pausedTime: 0,
-    isRunning: true,
-    intervalId: setInterval(() => {
-      if (session.timer?.isRunning) {
-        const elapsed = Date.now() - session.timer.startTime + session.timer.pausedTime;
-        const seconds = Math.floor(elapsed / 1000);
-        broadcastToSession(sessionId, { type: 'timer_update', seconds });
-      }
-    }, 1000)
-  };
-}
-
-function pauseTimer(sessionId) {
-  const session = sessions[sessionId];
-  if (!session?.timer?.isRunning) return;
-  session.timer.isRunning = false;
-  session.timer.pausedTime += Date.now() - session.timer.startTime;
-  clearInterval(session.timer.intervalId);
-  session.timer.intervalId = null;
-  const seconds = Math.floor(session.timer.pausedTime / 1000);
-  broadcastToSession(sessionId, { type: 'timer_update', seconds });
-}
-
-function stopTimer(sessionId) {
-  const session = sessions[sessionId];
-  if (!session?.timer) return;
-  if (session.timer.intervalId) clearInterval(session.timer.intervalId);
-  delete session.timer;
-  broadcastToSession(sessionId, { type: 'timer_update', seconds: 0 });
-}
-
-wss.on('connection', (ws, request) => {
-  const url = new URL(request.url, `http://${request.headers.host}`);
-  const sessionId = url.searchParams.get('sessionId');
-  const role = url.searchParams.get('role');
-  const lang = url.searchParams.get('lang') || 'en';
-
-  if (!sessionId || !role) {
-    ws.close(4001, 'sessionId и role обязательны');
-    return;
-  }
-
-  if (!sessions[sessionId]) {
-    sessions[sessionId] = { teacher: null, student: null, studentLang: 'en', timer: null };
-  }
-
-  sessions[sessionId][role] = ws;
-  if (role === 'teacher') sessions[sessionId].studentLang = lang;
-
-  const session = sessions[sessionId];
-  let currentTime = 0;
-  if (session.timer) {
-    const elapsed = session.timer.isRunning
-      ? Date.now() - session.timer.startTime + session.timer.pausedTime
-      : session.timer.pausedTime;
-    currentTime = Math.floor(elapsed / 1000);
-  }
-  ws.send(JSON.stringify({ type: 'timer_update', seconds: currentTime }));
-
-  ws.on('message', async (data) => {
+  ws.on('message', (data) => {
     try {
-      const parsed = JSON.parse(data);
-      if (parsed.type === 'timer_command' && role === 'teacher') {
-        switch (parsed.action) {
-          case 'start': startTimer(sessionId); break;
-          case 'pause': pauseTimer(sessionId); break;
-          case 'stop': stopTimer(sessionId); break;
-        }
-        return;
+      const message = JSON.parse(data);
+      const { type, sessionId } = message;
+
+      if (!sessionId) {
+        return ws.send(JSON.stringify({ type: 'error', message: 'sessionId обязателен' }));
       }
-      if (parsed.text) {
-        const session = sessions[sessionId];
-        let translatedText = '';
+
+      // Создаём сессию при первом обращении
+      if (!sessions[sessionId]) {
+        sessions[sessionId] = { teacher: null, students: [] };
+      }
+
+      if (type === 'join') {
+        const { role } = message;
+        ws.sessionId = sessionId;
+        ws.role = role;
+
         if (role === 'teacher') {
-          translatedText = await translateText(parsed.text, 'ru', session.studentLang);
-          if (session.student?.readyState === WebSocket.OPEN) {
-            session.student.send(JSON.stringify({ type: 'message', role: 'teacher', original: parsed.text, translated: translatedText }));
-          }
-          ws.send(JSON.stringify({ type: 'message', role: 'teacher', original: parsed.text, translated: translatedText }));
-        } else {
-          translatedText = await translateText(parsed.text, session.studentLang, 'ru');
-          if (session.teacher?.readyState === WebSocket.OPEN) {
-            session.teacher.send(JSON.stringify({ type: 'message', role: 'student', original: parsed.text, translated: translatedText }));
-          }
-          ws.send(JSON.stringify({ type: 'message', role: 'student', original: parsed.text, translated: translatedText }));
+          sessions[sessionId].teacher = ws;
+        } else if (role === 'student') {
+          sessions[sessionId].students.push(ws);
         }
+
+        ws.send(JSON.stringify({ type: 'joined', sessionId, role }));
+        console.log(`👤 ${role} присоединился к сессии ${sessionId}`);
       }
-    } catch (e) {
-      console.error('Ошибка:', e);
+
+      else if (type === 'chat') {
+        const { text, senderRole } = message;
+        const session = sessions[sessionId];
+        if (!session) return;
+
+        const recipients = [session.teacher, ...session.students].filter(Boolean);
+        const payload = JSON.stringify({
+          type: 'chat',
+          text,
+          senderRole,
+          timestamp: new Date().toISOString()
+        });
+
+        recipients.forEach(client => {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(payload);
+          }
+        });
+      }
+
+      else if (type === 'timer') {
+        const { action } = message;
+        const session = sessions[sessionId];
+        if (!session || ws !== session.teacher) {
+          return ws.send(JSON.stringify({ type: 'error', message: 'Только учитель может управлять таймером' }));
+        }
+
+        const recipients = [session.teacher, ...session.students].filter(Boolean);
+        const payload = JSON.stringify({ type: 'timer', action });
+        recipients.forEach(client => {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(payload);
+          }
+        });
+      }
+    } catch (err) {
+      console.error('❌ Ошибка обработки сообщения:', err.message);
+      ws.send(JSON.stringify({ type: 'error', message: 'Неверный формат сообщения' }));
     }
   });
 
   ws.on('close', () => {
-    sessions[sessionId][role] = null;
+    // Опционально: удалить ws из сессии
+    if (ws.sessionId && sessions[ws.sessionId]) {
+      const session = sessions[ws.sessionId];
+      if (session.teacher === ws) {
+        session.teacher = null;
+      } else {
+        session.students = session.students.filter(s => s !== ws);
+      }
+      console.log(`🔌 ${ws.role} отключился от сессии ${ws.sessionId}`);
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.error('WebSocket ошибка:', err.message);
   });
 });
 
-// Отдаём статику
-app.use(express.static(path.join(__dirname, 'public')));
-
-// SPA — все маршруты ведут к index.html
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
 const PORT = process.env.PORT || 3000;
+
 server.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на порту ${PORT}`);
+  console.log(`✅ HTTP + WebSocket сервер запущен на порту ${PORT}`);
+  console.log(`📁 Раздача статики из: ${PUBLIC_DIR}`);
 });

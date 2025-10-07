@@ -1,0 +1,2 @@
+git remote add origin https://github.com/gron8a-pixel/russian-tutor-full.git
+E:\1\russian-tutor-full\server\public\index.html папка index.html пустая
